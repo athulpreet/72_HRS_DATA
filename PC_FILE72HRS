@@ -1,0 +1,599 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+import csv
+import serial
+import serial.tools.list_ports
+import threading
+import time
+
+# For Excel export
+from openpyxl import Workbook
+
+# For PDF export
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import inch
+
+# For Plotting
+import matplotlib
+matplotlib.use("TkAgg")  # use TkAgg backend for tkinter
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+
+# ---------------------------------------------------
+# Global constants for commands (strings/bytes):
+# ---------------------------------------------------
+BAUD_RATE = 115200
+LOGGER_CMD = b'GET_72HRS_DATA\n'
+
+CMD_HEAD = b'HEAD\n'
+CMD_TRP = b'TRP\n'
+CMD_1TP = b'1TP\n'
+CMD_6TP = b'6TP\n'
+CMD_VIOL = b'VIOL\n'
+CMD_RST = b'RST\n'
+
+SET_SPEED_PREFIX = "SET_SPEED="
+SET_LIMP_PREFIX  = "SET_LIMP="
+SET_TIME_PREFIX  = "SET_TIME="
+
+SERIAL_READ_TIMEOUT = 2.0
+
+class LogDownloaderApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Vehicle Limiter Control & Log Downloader")
+
+        # Data containers
+        self.log_data = []
+        self.is_downloading = False
+        self.serial_port = None  # Will store user-selected COM port or None if not connected
+
+        # ----- Main Frame -----
+        main_frame = ttk.Frame(self.root, padding="10 10 10 10")
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        style = ttk.Style()
+        style.theme_use("clam")
+
+        # ------------------------------------------------
+        # 1. Connection Frame: Select/Refresh/Connect
+        # ------------------------------------------------
+        conn_frame = ttk.Labelframe(main_frame, text="Connection", padding="10 10 10 10")
+        conn_frame.pack(fill=tk.X, expand=False, pady=5)
+
+        # A dropdown (combobox) to list available ports
+        ttk.Label(conn_frame, text="Select Port:").grid(row=0, column=0, padx=5, pady=5, sticky="e")
+
+        self.port_var = tk.StringVar()  # holds the currently selected port from combobox
+        self.port_combo = ttk.Combobox(conn_frame, textvariable=self.port_var, state="readonly", width=15)
+        self.port_combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+
+        # Button to refresh port list
+        self.refresh_button = ttk.Button(conn_frame, text="Refresh Ports", command=self.refresh_ports)
+        self.refresh_button.grid(row=0, column=2, padx=5, pady=5)
+
+        # Connect button
+        self.connect_button = ttk.Button(conn_frame, text="Connect", command=self.on_connect)
+        self.connect_button.grid(row=0, column=3, padx=5, pady=5)
+
+        # Initially populate the dropdown
+        self.refresh_ports()
+
+        # ------------------------------------------------
+        # 2. Download & Export Frame
+        # ------------------------------------------------
+        top_frame = ttk.Labelframe(main_frame, text="Download & Export", padding="10 10 10 10")
+        top_frame.pack(fill=tk.X, expand=False, pady=5)
+
+        self.download_button = ttk.Button(top_frame, text="Download (GET_72HRS_DATA)", command=self.initiate_download)
+        self.download_button.grid(row=0, column=0, padx=5, pady=5)
+
+        self.csv_button = ttk.Button(top_frame, text="Export CSV", command=self.export_csv)
+        self.csv_button.grid(row=0, column=1, padx=5, pady=5)
+
+        self.excel_button = ttk.Button(top_frame, text="Export Excel", command=self.export_excel)
+        self.excel_button.grid(row=0, column=2, padx=5, pady=5)
+
+        self.pdf_button = ttk.Button(top_frame, text="Export PDF", command=self.export_pdf)
+        self.pdf_button.grid(row=0, column=3, padx=5, pady=5)
+
+        # Progress bar
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(top_frame, variable=self.progress_var, maximum=100)
+        self.progress_bar.grid(row=1, column=0, columnspan=4, sticky="ew", pady=5)
+
+        # ------------------------------------------------
+        # 3. Commands & Settings Frame
+        # ------------------------------------------------
+        cmd_frame = ttk.Labelframe(main_frame, text="Commands & Settings", padding="10 10 10 10")
+        cmd_frame.pack(fill=tk.X, expand=False, pady=5)
+
+        self.head_button = ttk.Button(cmd_frame, text="HEAD", command=lambda: self.send_simple_command(CMD_HEAD))
+        self.head_button.grid(row=0, column=0, padx=5, pady=5)
+
+        self.trp_button = ttk.Button(cmd_frame, text="TRP", command=lambda: self.send_simple_command(CMD_TRP))
+        self.trp_button.grid(row=0, column=1, padx=5, pady=5)
+
+        self.tp1_button = ttk.Button(cmd_frame, text="1TP", command=lambda: self.send_simple_command(CMD_1TP))
+        self.tp1_button.grid(row=0, column=2, padx=5, pady=5)
+
+        self.tp6_button = ttk.Button(cmd_frame, text="6TP", command=lambda: self.send_simple_command(CMD_6TP))
+        self.tp6_button.grid(row=0, column=3, padx=5, pady=5)
+
+        self.viol_button = ttk.Button(cmd_frame, text="VIOL", command=lambda: self.send_simple_command(CMD_VIOL))
+        self.viol_button.grid(row=0, column=4, padx=5, pady=5)
+
+        self.rst_button = ttk.Button(cmd_frame, text="RST", command=lambda: self.send_simple_command(CMD_RST))
+        self.rst_button.grid(row=0, column=5, padx=5, pady=5)
+
+        ttk.Label(cmd_frame, text="Set Speed (km/h):").grid(row=1, column=0, sticky="e", padx=5)
+        self.set_speed_entry = ttk.Entry(cmd_frame, width=8)
+        self.set_speed_entry.grid(row=1, column=1, sticky="w", padx=5)
+        self.set_speed_button = ttk.Button(cmd_frame, text="Send", command=self.send_set_speed)
+        self.set_speed_button.grid(row=1, column=2, padx=5, pady=5)
+
+        ttk.Label(cmd_frame, text="Limp Speed (km/h):").grid(row=2, column=0, sticky="e", padx=5)
+        self.set_limp_entry = ttk.Entry(cmd_frame, width=8)
+        self.set_limp_entry.grid(row=2, column=1, sticky="w", padx=5)
+        self.set_limp_button = ttk.Button(cmd_frame, text="Send", command=self.send_limp_speed)
+        self.set_limp_button.grid(row=2, column=2, padx=5, pady=5)
+
+        ttk.Label(cmd_frame, text="Set Device Time:").grid(row=3, column=0, sticky="e", padx=5)
+        self.set_time_entry = ttk.Entry(cmd_frame, width=18)
+        self.set_time_entry.insert(0, "2025-02-28 14:03:00")  # example
+        self.set_time_entry.grid(row=3, column=1, sticky="w", padx=5)
+        self.set_time_button = ttk.Button(cmd_frame, text="Send", command=self.send_time_setting)
+        self.set_time_button.grid(row=3, column=2, padx=5, pady=5)
+
+        # ------------------------------------------------
+        # 4. Filters & Visualization
+        # ------------------------------------------------
+        middle_frame = ttk.Labelframe(main_frame, text="Data Filters & Visualization", padding="10 10 10 10")
+        middle_frame.pack(fill=tk.X, expand=False, pady=5)
+
+        ttk.Label(middle_frame, text="Filter by Date (YYMMDD):").grid(row=0, column=0, padx=5, pady=2, sticky="e")
+        self.filter_date_entry = ttk.Entry(middle_frame, width=10)
+        self.filter_date_entry.grid(row=0, column=1, padx=5, pady=2, sticky="w")
+
+        ttk.Label(middle_frame, text="Filter by Time (HHMMSS):").grid(row=1, column=0, padx=5, pady=2, sticky="e")
+        self.filter_time_entry = ttk.Entry(middle_frame, width=10)
+        self.filter_time_entry.grid(row=1, column=1, padx=5, pady=2, sticky="w")
+
+        self.filter_button = ttk.Button(middle_frame, text="Apply Filter", command=self.apply_filter)
+        self.filter_button.grid(row=0, column=2, rowspan=2, padx=10, pady=2, sticky="ns")
+
+        self.plot_button = ttk.Button(middle_frame, text="Plot Speed vs Time", command=self.plot_speed_vs_time)
+        self.plot_button.grid(row=0, column=3, rowspan=2, padx=10, pady=2)
+
+        # ------------------------------------------------
+        # 5. Bottom Frame: Log Text
+        # ------------------------------------------------
+        bottom_frame = ttk.Labelframe(main_frame, text="Log Data", padding="10 10 10 10")
+        bottom_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.log_text = tk.Text(bottom_frame, width=80, height=15, wrap="none")
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        text_scroll_y = ttk.Scrollbar(bottom_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        text_scroll_y.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.configure(yscrollcommand=text_scroll_y.set)
+
+        # Initially, disable all the relevant buttons until connected
+        self.set_connection_state(connected=False)
+
+    # ----------------------------------------------------
+    # (A) Refresh Port List (No Filtering)
+    # ----------------------------------------------------
+    def refresh_ports(self):
+        """Scan for all available serial ports, update combobox list."""
+        ports = serial.tools.list_ports.comports()
+        port_list = [p.device for p in ports]  # gather ALL ports
+
+        if not port_list:
+            port_list = ["No serial device found"]
+
+        self.port_combo["values"] = port_list
+        if port_list and port_list[0] != "No serial device found":
+            self.port_combo.current(0)
+        else:
+            self.port_combo.set("")
+
+    # ----------------------------------------------------
+    # (B) Connect
+    # ----------------------------------------------------
+    def on_connect(self):
+        """User hits 'Connect' to set self.serial_port from combo selection."""
+        selected = self.port_var.get()
+        if not selected or "No serial device found" in selected:
+            messagebox.showwarning("Select Port", "No valid serial device selected.")
+            return
+
+        self.serial_port = selected
+        self.log_text.insert(tk.END, f"Connected to {self.serial_port}\n")
+
+        # Enable relevant controls
+        self.set_connection_state(connected=True)
+
+    def set_connection_state(self, connected: bool):
+        """
+        Enable/Disable controls that depend on an active serial port.
+        """
+        state = tk.NORMAL if connected else tk.DISABLED
+
+        # Download & export
+        self.download_button.config(state=state)
+        self.csv_button.config(state=tk.DISABLED)   # remains disabled until we have data
+        self.excel_button.config(state=tk.DISABLED) # remains disabled until we have data
+        self.pdf_button.config(state=tk.DISABLED)   # remains disabled until we have data
+
+        # Commands
+        self.head_button.config(state=state)
+        self.trp_button.config(state=state)
+        self.tp1_button.config(state=state)
+        self.tp6_button.config(state=state)
+        self.viol_button.config(state=state)
+        self.rst_button.config(state=state)
+
+        self.set_speed_button.config(state=state)
+        self.set_limp_button.config(state=state)
+        self.set_time_button.config(state=state)
+
+        # Filter & Plot
+        self.filter_button.config(state=state)
+        self.plot_button.config(state=tk.DISABLED)  # remains disabled until we have data
+
+    # ----------------------------------------------------
+    # 1. Download Logs
+    # ----------------------------------------------------
+    def initiate_download(self):
+        """Download from the device using GET_72HRS_DATA (LOGGER_CMD)."""
+        if self.is_downloading:
+            messagebox.showwarning("Download in progress", "A download is already in progress.")
+            return
+
+        if not self.serial_port:
+            messagebox.showerror("No Port Selected", "Please select and connect to a port first.")
+            return
+
+        self.is_downloading = True
+        self.progress_var.set(0)
+        self.log_text.delete("1.0", tk.END)
+        self.log_data.clear()
+
+        # Disable the download button while in progress
+        self.download_button.config(state=tk.DISABLED)
+
+        t = threading.Thread(target=self.download_logs)
+        t.start()
+
+    def download_logs(self):
+        """Threaded function that sends LOGGER_CMD and reads lines."""
+        try:
+            with serial.Serial(self.serial_port, BAUD_RATE, timeout=SERIAL_READ_TIMEOUT) as ser:
+                # Clear existing data
+                self.log_data = []
+                self.log_text.delete("1.0", tk.END)
+                self.log_text.insert(tk.END, "Requesting 72 hours of data, please wait...\n")
+                self.log_text.see(tk.END)  # Autoscroll
+                
+                # Send the command to the device
+                ser.write(LOGGER_CMD)
+                
+                # Increase timeout to handle longer data retrieval
+                start_time = time.time()
+                max_duration = 120.0  # 2 minutes (adjust if needed)
+                
+                # Variables for tracking progress
+                last_status_update = start_time
+                no_data_count = 0
+                total_entries = 0
+                
+                while True:
+                    line = ser.readline().decode('utf-8', errors='ignore').strip()
+                    
+                    # Check if we received valid data
+                    if line:
+                        no_data_count = 0  # Reset no-data counter when we get data
+                        
+                        # Check if this is a status message from the device
+                        if line.startswith("Transfer complete") or line.startswith("Error:"):
+                            self.log_text.insert(tk.END, f"[STATUS] {line}\n")
+                            self.log_text.see(tk.END)
+                            break  # End of data transfer
+                        elif line.startswith("Current time:") or line.startswith("Cutoff time:") or line.startswith("File size:"):
+                            self.log_text.insert(tk.END, f"[INFO] {line}\n")
+                            self.log_text.see(tk.END)
+                            continue
+                        
+                        # Check if this is a valid data line
+                        parts = line.split(',')
+                        if len(parts) >= 5:  # Valid data line with date,time,lon,lat,speed
+                            total_entries += 1
+                            self.log_data.append(parts)
+                            
+                            # Update status periodically to avoid overloading the UI
+                            if total_entries % 50 == 0:
+                                self.log_text.insert(tk.END, f"Received {total_entries} entries...\n")
+                                self.log_text.see(tk.END)
+                        else:
+                            # Log status messages but don't add to data
+                            self.log_text.insert(tk.END, f"[INFO] {line}\n")
+                            self.log_text.see(tk.END)
+                    else:
+                        # No data received in this read
+                        no_data_count += 1
+                        
+                        # If we've had several empty reads after receiving some data, we might be done
+                        if total_entries > 0 and no_data_count > 15:
+                            self.log_text.insert(tk.END, "No more data received, transfer complete.\n")
+                            break
+                    
+                    # Update progress bar
+                    elapsed = time.time() - start_time
+                    progress_percent = min((elapsed / max_duration) * 100, 100)
+                    self.progress_var.set(progress_percent)
+                    
+                    # Periodic status update
+                    if time.time() - last_status_update > 5.0:  # Update status every 5 seconds
+                        self.log_text.insert(tk.END, f"Still receiving data... {total_entries} entries so far\n")
+                        self.log_text.see(tk.END)
+                        last_status_update = time.time()
+                    
+                    # Check for timeout
+                    if elapsed > max_duration:
+                        self.log_text.insert(tk.END, "Maximum duration reached, transfer completed.\n")
+                        break
+                
+                # Final summary
+                self.log_text.insert(tk.END, f"\nDownload complete. Received {total_entries} entries.\n")
+                
+                # Show the last few entries as a preview
+                if total_entries > 0:
+                    self.log_text.insert(tk.END, "\nMost recent entries (preview):\n")
+                    preview_count = min(10, len(self.log_data))
+                    for entry in self.log_data[-preview_count:]:
+                        self.log_text.insert(tk.END, ",".join(entry) + "\n")
+                
+                # Enable export buttons if we received data
+                if self.log_data:
+                    self.csv_button.config(state=tk.NORMAL)
+                    self.excel_button.config(state=tk.NORMAL)
+                    self.pdf_button.config(state=tk.NORMAL)
+                    self.plot_button.config(state=tk.NORMAL)
+                    messagebox.showinfo("Download Complete", f"Log data downloaded successfully! {total_entries} entries received.")
+                else:
+                    messagebox.showinfo("No Data", "No log data was received.")
+
+        except serial.SerialException as e:
+            messagebox.showerror("Serial Error", f"Could not open serial port: {e}")
+        except Exception as ex:
+            messagebox.showerror("Error", f"An error occurred: {ex}")
+        finally:
+            self.is_downloading = False
+            # Re-enable the download button
+            self.download_button.config(state=tk.NORMAL if self.serial_port else tk.DISABLED)
+
+    # ----------------------------------------------------
+    # 2. Send Simple Commands
+    # ----------------------------------------------------
+    def send_simple_command(self, cmd_bytes):
+        if self.is_downloading:
+            messagebox.showwarning("Busy", "Download in progress. Try again later.")
+            return
+
+        if not self.serial_port:
+            messagebox.showerror("No Port", "Please connect to a port first.")
+            return
+
+        try:
+            with serial.Serial(self.serial_port, BAUD_RATE, timeout=SERIAL_READ_TIMEOUT) as ser:
+                ser.write(cmd_bytes)
+                time.sleep(0.5)  # Wait for device to respond
+                responses = []
+                while ser.in_waiting:
+                    line = ser.readline().decode('utf-8', errors='ignore').strip()
+                    if line:
+                        responses.append(line)
+
+            self.log_text.insert(tk.END, f"\n--- Command: {cmd_bytes.decode('utf-8').strip()} ---\n")
+            if responses:
+                for resp in responses:
+                    self.log_text.insert(tk.END, resp + "\n")
+            else:
+                self.log_text.insert(tk.END, "(No response)\n")
+
+        except serial.SerialException as e:
+            messagebox.showerror("Serial Error", f"Could not open serial port: {e}")
+        except Exception as ex:
+            messagebox.showerror("Error", f"An error occurred: {ex}")
+
+    # ----------------------------------------------------
+    # 3. Set Speed / Limp / Time
+    # ----------------------------------------------------
+    def send_set_speed(self):
+        speed_val = self.set_speed_entry.get().strip()
+        if not speed_val.isdigit():
+            messagebox.showwarning("Input Error", "Please enter a valid integer speed.")
+            return
+        cmd_str = SET_SPEED_PREFIX + speed_val + "\n"
+        self.send_simple_command(cmd_str.encode('utf-8'))
+
+    def send_limp_speed(self):
+        limp_val = self.set_limp_entry.get().strip()
+        if not limp_val.isdigit():
+            messagebox.showwarning("Input Error", "Please enter a valid integer limp speed.")
+            return
+        cmd_str = SET_LIMP_PREFIX + limp_val + "\n"
+        self.send_simple_command(cmd_str.encode('utf-8'))
+
+    def send_time_setting(self):
+        time_str = self.set_time_entry.get().strip()
+        if not time_str:
+            messagebox.showwarning("Input Error", "Please enter a valid time string.")
+            return
+        cmd_str = SET_TIME_PREFIX + time_str + "\n"
+        self.send_simple_command(cmd_str.encode('utf-8'))
+
+    # ----------------------------------------------------
+    # 4. Filtering
+    # ----------------------------------------------------
+    def apply_filter(self):
+        date_filter = self.filter_date_entry.get().strip()
+        time_filter = self.filter_time_entry.get().strip()
+
+        filtered = []
+        for row in self.log_data:
+            date_, log_time, lat, lon, speed = row
+            if date_filter and not date_.startswith(date_filter):
+                continue
+            if time_filter and not log_time.startswith(time_filter):
+                continue
+            filtered.append(row)
+
+        self.log_text.delete("1.0", tk.END)
+        for row in filtered:
+            line_str = ",".join(row)
+            self.log_text.insert(tk.END, line_str + "\n")
+
+    # ----------------------------------------------------
+    # 5. Exports (CSV, Excel, PDF)
+    # ----------------------------------------------------
+    def export_csv(self):
+        if not self.log_data:
+            messagebox.showwarning("No Data", "No log data to export.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, mode='w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Date", "Time", "Latitude", "Longitude", "Speed"])
+                for row in self.log_data:
+                    writer.writerow(row)
+            messagebox.showinfo("Success", f"Data exported to CSV:\n{file_path}")
+        except Exception as ex:
+            messagebox.showerror("Error", f"Could not export CSV: {ex}")
+
+    def export_excel(self):
+        if not self.log_data:
+            messagebox.showwarning("No Data", "No log data to export.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel Files", "*.xlsx"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+
+        try:
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Log Data"
+            ws.append(["Date", "Time", "Latitude", "Longitude", "Speed"])
+            for row in self.log_data:
+                ws.append(row)
+            wb.save(file_path)
+            messagebox.showinfo("Success", f"Data exported to Excel:\n{file_path}")
+        except Exception as ex:
+            messagebox.showerror("Error", f"Could not export Excel: {ex}")
+
+    def export_pdf(self):
+        if not self.log_data:
+            messagebox.showwarning("No Data", "No log data to export.")
+            return
+
+        file_path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
+        )
+        if not file_path:
+            return
+
+        try:
+            c = canvas.Canvas(file_path, pagesize=letter)
+            width, height = letter
+            x_margin = inch
+            y_margin = height - inch
+
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(x_margin, y_margin, "Log Data Report")
+            c.setFont("Helvetica", 10)
+
+            table_y_start = y_margin - 0.5 * inch
+            headers = ["Date", "Time", "Latitude", "Longitude", "Speed"]
+            row_height = 15
+            col_offsets = [0, 80, 160, 240, 320]
+
+            # Draw header row
+            for i, h in enumerate(headers):
+                c.drawString(x_margin + col_offsets[i], table_y_start, h)
+
+            y_pos = table_y_start - row_height
+            for row in self.log_data:
+                for i, cell in enumerate(row):
+                    c.drawString(x_margin + col_offsets[i], y_pos, str(cell))
+                y_pos -= row_height
+                # If we run off the page, start a new one
+                if y_pos < inch:
+                    c.showPage()
+                    c.setFont("Helvetica", 10)
+                    y_pos = height - inch
+
+            c.showPage()
+            c.save()
+            messagebox.showinfo("Success", f"Data exported to PDF:\n{file_path}")
+        except Exception as ex:
+            messagebox.showerror("Error", f"Could not export PDF: {ex}")
+
+    # ----------------------------------------------------
+    # 6. Plotting
+    # ----------------------------------------------------
+    def plot_speed_vs_time(self):
+        if not self.log_data:
+            messagebox.showwarning("No Data", "No log data to plot.")
+            return
+
+        speeds = []
+        for row in self.log_data:
+            try:
+                spd = float(row[4])
+            except:
+                spd = 0.0
+            speeds.append(spd)
+
+        plot_window = tk.Toplevel(self.root)
+        plot_window.title("Speed vs. Log Index")
+
+        fig = Figure(figsize=(6, 4), dpi=100)
+        ax = fig.add_subplot(111)
+        ax.plot(speeds, marker='o', linestyle='-')
+        ax.set_title("Speed vs. Log Index")
+        ax.set_xlabel("Log Index")
+        ax.set_ylabel("Speed")
+
+        canvas = FigureCanvasTkAgg(fig, master=plot_window)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        toolbar_frame = ttk.Frame(plot_window)
+        toolbar_frame.pack(fill=tk.X, expand=False)
+        toolbar = NavigationToolbar2Tk(canvas, toolbar_frame)
+        toolbar.update()
+
+
+def main():
+    root = tk.Tk()
+    app = LogDownloaderApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
